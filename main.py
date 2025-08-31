@@ -18,14 +18,15 @@ try:
 except Exception:
     easyocr = None
 
-# ---- NEW: Import the OpenAI library for DeepSeek ----
 from openai import OpenAI
 
-# --- Categories for classification ---
-CATEGORIES = [
-    "Personal", "School", "Work", "Finance", "Research", "Code", "Datasets",
-    "Photos", "Screenshots", "Design", "Audio", "Video",
-    "Installers", "Archives", "Other",
+# --- MODIFIED: Simplified primary categories ---
+PRIMARY_CATEGORIES = ["Personal", "Work"]
+
+# --- NEW: Defined list of potential work subcategories to guide the AI ---
+WORK_SUBCATEGORIES_EXAMPLES = [
+    "Reports", "Invoices & Finance", "Presentations", "Meeting Notes",
+    "Legal & Contracts", "Code & Scripts", "Research", "Project Plans", "Design Mockups"
 ]
 
 STOPWORDS = set("""
@@ -33,7 +34,7 @@ a an and are as at be by for from has have if in into is it its of on or that th
 pdf doc docx ppt pptx xls xlsx csv txt page file report note photo image picture screenshot scan camera iphone samsung android
 """.split())
 
-# --- (All file extraction and helper functions like sha256, sniff_text, etc. remain unchanged) ---
+# --- (All file extraction and helper functions remain unchanged) ---
 def sha256(path: Path, max_bytes: int = 300 * 1024 * 1024) -> str | None:
     try:
         if path.stat().st_size > max_bytes: return None
@@ -125,20 +126,19 @@ def read_snippet(path: Path, mime: str, reader=None, max_bytes=400_000) -> Tuple
         ocr = extract_image_ocr_easyocr(reader, path)
         text = (meta_s + ("\n\nOCR:\n" + ocr if ocr else "")).strip()
     return text[:max_bytes], meta
-def simple_subcategory_snippet(text: str, fallback: str = "") -> str:
-    words = re.findall(r"[A-Za-z][A-Za-z0-9_\-]{2,}", text.lower())
-    words = [w for w in words if w not in STOPWORDS and len(w) <= 24]
-    common = [w for w, _ in Counter(words).most_common(6)]
-    out = " ".join(common[:3]).strip()
-    return out or fallback
-def choose_target(base: Path, label: str, subcategory: str, auto_ok: bool) -> Path:
-    if not auto_ok:
-        return base / "Unsorted_Review"
+
+def choose_target(base: Path, label: str, subcategory: str) -> Path:
     if label == "Personal":
+        # All personal files go into a single "Personal" folder
         return base / "Personal"
-    safe_cat = "".join(c for c in label if c.isalnum() or c in "-_ ").strip() or "Other"
+    
+    # All work files go into "Work" and then a specific subcategory
+    safe_cat = "Work"
     safe_sub = "".join(c for c in subcategory if c.isalnum() or c in "-_ ").strip()
+    
+    # If the AI fails to provide a subcategory, put it in a generic "Work" folder
     return (base / safe_cat / safe_sub) if safe_sub else (base / safe_cat)
+
 def unique_destination(dst: Path) -> Path:
     if not dst.exists(): return dst
     stem, suf = dst.stem, dst.suffix
@@ -147,20 +147,19 @@ def unique_destination(dst: Path) -> Path:
         if not cand.exists(): return cand
     return dst.with_name(f"{stem}-dup{int(time.time())}{suf}")
 
-# ---- NEW: LLM CLASSIFICATION FUNCTION for DeepSeek ----
-def classify_with_deepseek(client: OpenAI, file_name: str, content: str) -> Optional[str]:
-    """
-    Classifies content using the DeepSeek API and returns a single category name.
-    """
-    system_prompt = f"""
-    You are an expert file organizer. Your task is to classify a file into ONE of the following categories:
-    {', '.join(CATEGORIES)}
+# ---- MODIFIED: Two new LLM functions for the two-step process ----
 
-    Analyze the file's name and content, then respond with ONLY a JSON object containing the chosen category.
-    Your response MUST be in the format: {{"category": "ChosenCategory"}}
+def get_primary_category(client: OpenAI, file_name: str, content: str) -> Optional[str]:
+    """STEP 1: Classifies content as either 'Personal' or 'Work'."""
+    system_prompt = f"""
+    You are an expert file organizer. Your first task is to determine if a file is 'Personal' or 'Work'.
+    'Personal' includes family photos, personal documents, hobbies, etc.
+    'Work' includes professional reports, code, invoices, presentations, research, etc.
+
+    Analyze the file's name and content preview below.
+    Respond with ONLY a JSON object in the format: {{"category": "ChosenCategory"}}
     """
-    
-    user_prompt = f"Filename: {file_name}\n\nFile Content Preview:\n{content[:8000]}"
+    user_prompt = f"Filename: {file_name}\n\nFile Content Preview:\n{content[:10000]}"
 
     try:
         response = client.chat.completions.create(
@@ -169,43 +168,59 @@ def classify_with_deepseek(client: OpenAI, file_name: str, content: str) -> Opti
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            stream=False,
-            # Forcing JSON output is a good practice if the model supports it
-            response_format={"type": "json_object"},
+            stream=False, response_format={"type": "json_object"},
         )
-        
-        response_text = response.choices[0].message.content
-        data = json.loads(response_text)
+        data = json.loads(response.choices[0].message.content)
         category = data.get("category")
-
-        if category in CATEGORIES:
-            return category
-        else:
-            print(f"[WARN] LLM returned an invalid category: {category}")
-            return "Other"
-            
+        return category if category in PRIMARY_CATEGORIES else "Personal"
     except Exception as e:
-        print(f"[ERROR] DeepSeek API call failed: {e}")
+        print(f"[ERROR] DeepSeek Step 1 (Category) failed: {e}")
         return None
 
+def get_work_subcategory(client: OpenAI, file_name: str, content: str) -> str:
+    """STEP 2: For 'Work' files, determines a specific subcategory."""
+    system_prompt = f"""
+    You are an expert file organizer. You have determined the following file is a 'Work' document.
+    Your next task is to create a concise, one-to-three-word subcategory name for it.
+    
+    Base your subcategory on the document's specific content.
+    Examples of good subcategories: {', '.join(WORK_SUBCATEGORIES_EXAMPLES)}
+
+    Analyze the file's name and content preview below.
+    Respond with ONLY a JSON object in the format: {{"subcategory": "Generated Subcategory Name"}}
+    """
+    user_prompt = f"Filename: {file_name}\n\nFile Content Preview:\n{content[:10000]}"
+    
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            stream=False, response_format={"type": "json_object"},
+        )
+        data = json.loads(response.choices[0].message.content)
+        return data.get("subcategory", "General")
+    except Exception as e:
+        print(f"[ERROR] DeepSeek Step 2 (Subcategory) failed: {e}")
+        return "General" # Fallback subcategory
+
 def main():
-    ap = argparse.ArgumentParser(description="LLM-powered local file sorter using DeepSeek")
+    ap = argparse.ArgumentParser(description="Focused LLM file sorter (Personal vs Work) using DeepSeek")
     ap.add_argument("source", help="Folder to sort")
     ap.add_argument("--dest", default=None, help="Destination base (default: <source>/Sorted_AI)")
     ap.add_argument("--move", action="store_true", help="Move files (default: dry-run)")
     ap.add_argument("--copy", action="store_true", help="Copy files (safe mode)")
     ap.add_argument("--limit", type=int, default=0, help="Max files to process (0 = all)")
-    ap.add_argument("--minconf", type=float, default=0.90, help="Confidence threshold (for logging). LLM is generally confident.")
-    ap.add_argument("--ocr_langs", default="en", help="Comma-separated OCR languages (e.g., en,ko,de)")
+    ap.add_argument("--ocr_langs", default="en", help="Comma-separated OCR languages")
     ap.add_argument("--ocr_gpu", action="store_true", help="Use GPU for EasyOCR if available")
     args = ap.parse_args()
 
-    # --- API Key Check ---
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
-        sys.exit("Error: DEEPSEEK_API_KEY environment variable not set. Please get a key from platform.deepseek.com.")
+        sys.exit("Error: DEEPSEEK_API_KEY environment variable not set.")
     
-    # --- Initialize the LLM Client for DeepSeek ---
     print("Initializing DeepSeek client...")
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 
@@ -214,15 +229,14 @@ def main():
         sys.exit(f"Source not found: {source}")
 
     dest_base = Path(args.dest).expanduser().resolve() if args.dest else (source / "Sorted_AI")
-    for d in (dest_base, dest_base / "Unsorted_Review", dest_base / "_logs"):
+    for d in (dest_base, dest_base / "Personal", dest_base / "Work"):
         d.mkdir(parents=True, exist_ok=True)
 
-    def prelabel(path: Path, mime: str) -> str | None:
+    def prelabel(path: Path) -> str | None:
+        """Only pre-label non-document files to save API calls."""
         ext = path.suffix.lower()
-        name = path.name.lower()
         if ext in {".exe", ".msi", ".pkg", ".dmg"}: return "Installers"
         if ext in {".zip",".rar",".7z",".tar",".gz",".bz2",".xz"}: return "Archives"
-        if mime.startswith("image/") and any(s in name for s in ["screenshot", "screen shot", "snip"]): return "Screenshots"
         if ext in {".mp3", ".wav", ".m4a", ".flac"}: return "Audio"
         if ext in {".mp4", ".mov", ".avi", ".mkv"}: return "Video"
         return None
@@ -240,7 +254,7 @@ def main():
     with log_csv.open("a", newline="", encoding="utf-8") as logf:
         writer = csv.writer(logf)
         if new_log:
-            writer.writerow(["ts","action","from","to","label","subcategory","confidence","hash","model"])
+            writer.writerow(["ts","action","from","to","label","subcategory","hash","model"])
 
         processed = 0
         for entry in source.iterdir():
@@ -250,23 +264,34 @@ def main():
                 mime, _ = mimetypes.guess_type(entry.name)
                 mime = mime or "application/octet-stream"
                 
-                early = prelabel(entry, mime)
-                text, meta = read_snippet(entry, mime, reader=reader)
-
-                if early is None:
-                    label = classify_with_deepseek(client, entry.name, text)
-                    conf = 0.95 if label and label != "Other" else 0.10
-                    if label is None:
-                        label = "Other"
+                label, subcat = "Other", ""
+                
+                # Check for non-document files first
+                hardcoded_label = prelabel(entry)
+                if hardcoded_label:
+                    label, subcat = hardcoded_label, ""
+                    # Create a folder for these types if they don't exist
+                    (dest_base / label).mkdir(exist_ok=True)
                 else:
-                    label, conf = early, 0.99
+                    # It's a document, so let the AI read it and decide
+                    text, meta = read_snippet(entry, mime, reader=reader)
+                    
+                    # Step 1: Is it Personal or Work?
+                    primary_category = get_primary_category(client, entry.name, text)
+                    time.sleep(1) # Respect API rate limits
 
-                subcat = ""
-                if label not in ["Personal", "Installers", "Archives"]:
-                    subcat = simple_subcategory_snippet(text)
+                    if primary_category == "Work":
+                        label = "Work"
+                        # Step 2: If Work, get a specific subcategory
+                        subcat = get_work_subcategory(client, entry.name, text)
+                        time.sleep(1)
+                    elif primary_category == "Personal":
+                        label = "Personal"
+                        subcat = "" # No subcategories for Personal
+                    else:
+                        label = "Personal" # Default to Personal on failure
 
-                auto_ok = conf >= args.minconf
-                target_dir = choose_target(dest_base, label, subcat, auto_ok)
+                target_dir = choose_target(dest_base, label, subcat)
                 target_dir.mkdir(parents=True, exist_ok=True)
                 dst = unique_destination(target_dir / entry.name)
 
@@ -277,14 +302,14 @@ def main():
                     shutil.move(str(entry), str(dst)); action = "MOVE"
 
                 file_hash = sha256(dst if action != "DRYRUN" else entry) or ""
-                writer.writerow([int(time.time()), action, str(entry), str(dst), label, subcat, f"{conf:.3f}", file_hash, "deepseek-chat"])
-                print(f"[{action}] {entry.name} -> {target_dir.name} ({label}/{subcat or ''}, conf={conf:.2f})")
+                writer.writerow([int(time.time()), action, str(entry), str(dst), label, subcat, file_hash, "deepseek-chat"])
+                print(f"[{action}] {entry.name} -> {target_dir.relative_to(dest_base)} (Main: {label}, Sub: {subcat or 'N/A'})")
                 processed += 1
-                time.sleep(1)
+
             except KeyboardInterrupt:
                 print("\nInterrupted."); break
             except Exception as e:
-                writer.writerow([int(time.time()), "ERROR", str(entry), "", "", "", "", "", f"{type(e).__name__}:{e}"])
+                writer.writerow([int(time.time()), "ERROR", str(entry), "", "", "", f"{type(e).__name__}:{e}"])
                 print(f"[ERROR] {entry.name}: {e}")
 
 if __name__ == "__main__":
