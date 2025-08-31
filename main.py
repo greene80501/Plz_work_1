@@ -20,10 +20,9 @@ except Exception:
 
 from openai import OpenAI
 
-# --- MODIFIED: Simplified primary categories ---
+# --- Main categories remain focused ---
 PRIMARY_CATEGORIES = ["Personal", "Work"]
 
-# --- NEW: Defined list of potential work subcategories to guide the AI ---
 WORK_SUBCATEGORIES_EXAMPLES = [
     "Reports", "Invoices & Finance", "Presentations", "Meeting Notes",
     "Legal & Contracts", "Code & Scripts", "Research", "Project Plans", "Design Mockups"
@@ -129,14 +128,9 @@ def read_snippet(path: Path, mime: str, reader=None, max_bytes=400_000) -> Tuple
 
 def choose_target(base: Path, label: str, subcategory: str) -> Path:
     if label == "Personal":
-        # All personal files go into a single "Personal" folder
         return base / "Personal"
-    
-    # All work files go into "Work" and then a specific subcategory
     safe_cat = "Work"
     safe_sub = "".join(c for c in subcategory if c.isalnum() or c in "-_ ").strip()
-    
-    # If the AI fails to provide a subcategory, put it in a generic "Work" folder
     return (base / safe_cat / safe_sub) if safe_sub else (base / safe_cat)
 
 def unique_destination(dst: Path) -> Path:
@@ -147,19 +141,22 @@ def unique_destination(dst: Path) -> Path:
         if not cand.exists(): return cand
     return dst.with_name(f"{stem}-dup{int(time.time())}{suf}")
 
-# ---- MODIFIED: Two new LLM functions for the two-step process ----
+# ---- MODIFIED: LLM functions now have a "Work" bias ----
 
 def get_primary_category(client: OpenAI, file_name: str, content: str) -> Optional[str]:
-    """STEP 1: Classifies content as either 'Personal' or 'Work'."""
+    """STEP 1: Classifies content as either 'Personal' or 'Work' with a strong bias towards 'Work'."""
+    # --- PROMPT MODIFICATION ---
     system_prompt = f"""
     You are an expert file organizer. Your first task is to determine if a file is 'Personal' or 'Work'.
-    'Personal' includes family photos, personal documents, hobbies, etc.
-    'Work' includes professional reports, code, invoices, presentations, research, etc.
+
+    IMPORTANT: Assume a file is 'Work' unless there is strong, clear evidence it is 'Personal'.
+    'Personal' files are strictly non-professional, like family photos, personal letters, medical documents, or private hobbies.
+    'Work' includes everything else: reports, code, invoices, presentations, research, articles, etc.
 
     Analyze the file's name and content preview below.
     Respond with ONLY a JSON object in the format: {{"category": "ChosenCategory"}}
     """
-    user_prompt = f"Filename: {file_name}\n\nFile Content Preview:\n{content[:10000]}"
+    user_prompt = f"Filename: {file_name}\n\nFile Content Preview:\n{content[:12000]}" # Increased context size
 
     try:
         response = client.chat.completions.create(
@@ -172,24 +169,27 @@ def get_primary_category(client: OpenAI, file_name: str, content: str) -> Option
         )
         data = json.loads(response.choices[0].message.content)
         category = data.get("category")
-        return category if category in PRIMARY_CATEGORIES else "Personal"
+        # --- FALLBACK MODIFICATION ---
+        return category if category in PRIMARY_CATEGORIES else "Work"
     except Exception as e:
         print(f"[ERROR] DeepSeek Step 1 (Category) failed: {e}")
-        return None
+        return None # Will be handled in main loop and default to 'Work'
 
 def get_work_subcategory(client: OpenAI, file_name: str, content: str) -> str:
     """STEP 2: For 'Work' files, determines a specific subcategory."""
+    # --- PROMPT MODIFICATION ---
     system_prompt = f"""
     You are an expert file organizer. You have determined the following file is a 'Work' document.
-    Your next task is to create a concise, one-to-three-word subcategory name for it.
-    
-    Base your subcategory on the document's specific content.
+    Your task is to create a concise, one-to-three-word subcategory name for it.
+
+    Base your subcategory on the document's most specific topic, project name, or client name.
     Examples of good subcategories: {', '.join(WORK_SUBCATEGORIES_EXAMPLES)}
+    If you see a project name like "Project Phoenix", use that. If you see an invoice for "Acme Corp", use "Acme Corp".
 
     Analyze the file's name and content preview below.
     Respond with ONLY a JSON object in the format: {{"subcategory": "Generated Subcategory Name"}}
     """
-    user_prompt = f"Filename: {file_name}\n\nFile Content Preview:\n{content[:10000]}"
+    user_prompt = f"Filename: {file_name}\n\nFile Content Preview:\n{content[:12000]}"
     
     try:
         response = client.chat.completions.create(
@@ -204,7 +204,7 @@ def get_work_subcategory(client: OpenAI, file_name: str, content: str) -> str:
         return data.get("subcategory", "General")
     except Exception as e:
         print(f"[ERROR] DeepSeek Step 2 (Subcategory) failed: {e}")
-        return "General" # Fallback subcategory
+        return "General"
 
 def main():
     ap = argparse.ArgumentParser(description="Focused LLM file sorter (Personal vs Work) using DeepSeek")
@@ -233,7 +233,6 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     def prelabel(path: Path) -> str | None:
-        """Only pre-label non-document files to save API calls."""
         ext = path.suffix.lower()
         if ext in {".exe", ".msi", ".pkg", ".dmg"}: return "Installers"
         if ext in {".zip",".rar",".7z",".tar",".gz",".bz2",".xz"}: return "Archives"
@@ -246,7 +245,7 @@ def main():
         reader = None
     else:
         langs = [s.strip() for s in args.ocr_langs.split(",") if s.strip()]
-        print(f"Loading EasyOCR ({'+'.join(langs)}), gpu={args.ocr_gpu} …")
+        print(f"Loading EasyOCR ({'+'.join(langs)}), gpu={args.gpu} …")
         reader = easyocr.Reader(langs, gpu=args.ocr_gpu)
 
     log_csv = dest_base / "_logs" / "moves.csv"
@@ -266,30 +265,27 @@ def main():
                 
                 label, subcat = "Other", ""
                 
-                # Check for non-document files first
                 hardcoded_label = prelabel(entry)
                 if hardcoded_label:
                     label, subcat = hardcoded_label, ""
-                    # Create a folder for these types if they don't exist
                     (dest_base / label).mkdir(exist_ok=True)
                 else:
-                    # It's a document, so let the AI read it and decide
                     text, meta = read_snippet(entry, mime, reader=reader)
                     
-                    # Step 1: Is it Personal or Work?
                     primary_category = get_primary_category(client, entry.name, text)
-                    time.sleep(1) # Respect API rate limits
+                    time.sleep(1)
 
                     if primary_category == "Work":
                         label = "Work"
-                        # Step 2: If Work, get a specific subcategory
                         subcat = get_work_subcategory(client, entry.name, text)
                         time.sleep(1)
                     elif primary_category == "Personal":
                         label = "Personal"
-                        subcat = "" # No subcategories for Personal
-                    else:
-                        label = "Personal" # Default to Personal on failure
+                        subcat = ""
+                    else: # --- FALLBACK MODIFICATION ---
+                        # If the API call failed or returned None, default to Work
+                        label = "Work"
+                        subcat = "General"
 
                 target_dir = choose_target(dest_base, label, subcat)
                 target_dir.mkdir(parents=True, exist_ok=True)
@@ -309,7 +305,7 @@ def main():
             except KeyboardInterrupt:
                 print("\nInterrupted."); break
             except Exception as e:
-                writer.writerow([int(time.time()), "ERROR", str(entry), "", "", "", f"{type(e).__name__}:{e}"])
+                writer.writerow([int(time.time()), "ERROR", str(entry), "", "", "", "", f"{type(e).__name__}:{e}"])
                 print(f"[ERROR] {entry.name}: {e}")
 
 if __name__ == "__main__":
